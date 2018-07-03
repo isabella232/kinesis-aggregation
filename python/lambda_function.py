@@ -13,43 +13,53 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-from aws_kinesis_agg.deaggregator import deaggregate_records, iter_deaggregate_records
-import base64
-import six
+from __future__ import print_function
 
+import aws_kinesis_agg.aggregator
+import uuid
 
-def lambda_bulk_handler(event, context):
-    """A Python AWS Lambda function to process Kinesis aggregated
-    records in a bulk fashion."""
-    
-    raw_kinesis_records = event['Records']
-    
-    # Deaggregate all records in one call
-    user_records = deaggregate_records(raw_kinesis_records)
-    
-    # Iterate through deaggregated records
-    for record in user_records:        
-        
-        # Kinesis data in Python Lambdas is base64 encoded
-        payload = base64.b64decode(record['kinesis']['data'])
-        six.print_('%s' % payload)
-    
-    return 'Successfully processed {} records.'.format(len(user_records))
+import json
+import urllib
+import boto3
+from io import BytesIO
+from gzip import GzipFile
+import time
 
+s3 = boto3.client('s3')
+kinesis = boto3.client('kinesis')
 
-def lambda_generator_handler(event, context):
-    """A Python AWS Lambda function to process Kinesis aggregated
-    records in a generator-based fashion."""
-    
-    raw_kinesis_records = event['Records']
-    record_count = 0
-    
-    # Deaggregate all records using a generator function
-    for record in iter_deaggregate_records(raw_kinesis_records):   
-             
-        # Kinesis data in Python Lambdas is base64 encoded
-        payload = base64.b64decode(record['kinesis']['data'])
-        six.print_('%s' % payload)
-        record_count += 1
-        
-    return 'Successfully processed {} records.'.format(record_count)
+def lambda_handler(event, context):
+    # Get the S3 object from the event
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = urllib.unquote_plus(event['Records'][0]['s3']['object']['key'].encode('utf8'))
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+        compressed = BytesIO(response['Body'].read())
+        decompressed = GzipFile(None, 'rb', fileobj=compressed).read()
+        lines = decompressed.split('\n')
+        records = []
+        res = None
+        failures = 0
+        kinesis_aggregator = aws_kinesis_agg.aggregator.RecordAggregator()
+        for idx, line in enumerate(lines):
+            # just use random partition key (could use user_id for transform)
+            partition_key = str(uuid.uuid4())
+            explicit_hash_key = str(uuid.uuid4().int)
+            rec = {'Data': line, 'PartitionKey': partition_key, 'ExplicitHashKey': explicit_hash_key}
+            # keep adding records to the aggregator until it's full
+            result = kinesis_aggregator.add_user_record(rec['PartitionKey'], rec['Data'], rec['ExplicitHashKey'])
+            if result:
+                records.append(rec)
+                kinesis_aggregator = aws_kinesis_agg.aggregator.RecordAggregator()
+                if len(records) > 499:
+                    res = kinesis.put_records(Records=records, StreamName="staging-transform")
+                    failures += res['FailedRecordCount']
+                    time.sleep(1)
+                    records = []
+        if len(records) > 0:
+            res = kinesis.put_records(Records=records, StreamName="staging-transform")
+            failures += res['FailedRecordCount']
+        return failures
+    except Exception as e:
+        print(e)
+        raise e
