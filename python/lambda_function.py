@@ -27,39 +27,45 @@ import time
 
 s3 = boto3.client('s3')
 kinesis = boto3.client('kinesis')
+records = []
+failures = 0
+
+def collect_record(record):
+    global records
+    pk, ehk, data = record.get_contents()
+    res = kinesis.put_record(StreamName='staging-transform',
+                       Data=data,
+                       PartitionKey=pk,
+                       ExplicitHashKey=ehk)
+    # Stupid hack to reduce throttling
+    time.sleep(1)
 
 def lambda_handler(event, context):
-    # Get the S3 object from the event
+    global failures
     bucket = event['Records'][0]['s3']['bucket']['name']
     key = urllib.unquote_plus(event['Records'][0]['s3']['object']['key'].encode('utf8'))
     try:
+        # Get the S3 object from the event
         response = s3.get_object(Bucket=bucket, Key=key)
         compressed = BytesIO(response['Body'].read())
         decompressed = GzipFile(None, 'rb', fileobj=compressed).read()
         lines = decompressed.split('\n')
-        records = []
-        res = None
-        failures = 0
+
+        # Initialize kinesis aggregator
         kinesis_aggregator = aws_kinesis_agg.aggregator.RecordAggregator()
+        kinesis_aggregator.on_record_complete(collect_record)
         for idx, line in enumerate(lines):
             # just use random partition key (could use user_id for transform)
             partition_key = str(uuid.uuid4())
             explicit_hash_key = str(uuid.uuid4().int)
-            rec = {'Data': line, 'PartitionKey': partition_key, 'ExplicitHashKey': explicit_hash_key}
             # keep adding records to the aggregator until it's full
-            result = kinesis_aggregator.add_user_record(rec['PartitionKey'], rec['Data'], rec['ExplicitHashKey'])
-            if result:
-                records.append(rec)
-                kinesis_aggregator = aws_kinesis_agg.aggregator.RecordAggregator()
-                if len(records) > 499:
-                    res = kinesis.put_records(Records=records, StreamName="staging-transform")
-                    failures += res['FailedRecordCount']
-                    time.sleep(1)
-                    records = []
+            kinesis_aggregator.add_user_record(partition_key, line, explicit_hash_key)
         if len(records) > 0:
+            collect_record(kinesis_aggregator.clear_and_get())
             res = kinesis.put_records(Records=records, StreamName="staging-transform")
             failures += res['FailedRecordCount']
         return failures
     except Exception as e:
         print(e)
-        raise e
+        # TODO: handle backoff
+        pass
